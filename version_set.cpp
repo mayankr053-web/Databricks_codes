@@ -1,115 +1,118 @@
 #include <iostream>
-#include <list>
 #include <unordered_map>
-#include <functional>
+#include <mutex>
+#include <limits>
 
 template<typename T>
-class CustomSet {
-private:
+class VersionedSet {
     struct Node {
         T value;
-        size_t add_version;    // when node becomes visible to iterations
-        size_t remove_version; // when node becomes invisible (0 if not removed)
-        bool present;          // immediate presence for contains()
+        uint64_t insert_ver;
+        uint64_t delete_ver;
+        Node* next;
+        Node(const T& v, uint64_t ins)
+            : value(v), insert_ver(ins),
+              delete_ver(std::numeric_limits<uint64_t>::max()),
+              next(nullptr) {}
     };
 
-    std::list<Node> nodes;
-    std::unordered_map<T, typename std::list<Node>::iterator> lookup;
-
-    size_t version = 1;           // current committed version
-    size_t active_iterators = 0;  // how many snapshots are active
-
-    // helper to gc nodes when safe
-    void garbage_collect_if_safe() {
-        if (active_iterators != 0) return; // only safe when no active iterators
-        for (auto it = nodes.begin(); it != nodes.end(); ) {
-            if (!it->present) {
-                lookup.erase(it->value);
-                it = nodes.erase(it);
-            } else ++it;
-        }
-    }
+    Node* head;    // dummy sentinel
+    Node* tail;
+    std::unordered_map<T, Node*> map;
+    uint64_t version = 0;  // global version counter
+    std::mutex mtx;
 
 public:
-    CustomSet() = default;
-
-    bool contains(const T &value) const {
-        auto it = lookup.find(value);
-        if (it == lookup.end()) return false;
-        return it->second->present;
+    VersionedSet() {
+        head = new Node(T{}, 0);  // sentinel node
+        tail = head;
     }
 
-    void add(const T &value) {
-        auto it = lookup.find(value);
-        if (it == lookup.end()) {
-            // new node
-            size_t av = (active_iterators > 0 ? version + 1 : version);
-            nodes.push_back(Node{value, av, 0, true});
-            lookup[value] = std::prev(nodes.end());
-        } else {
-            auto nit = it->second;
-            if (nit->present) return; // already present
-            // resurrect
-            nit->present = true;
-            nit->remove_version = 0;
-            nit->add_version = (active_iterators > 0 ? version + 1 : version);
+    ~VersionedSet() {
+        Node* cur = head;
+        while (cur) {
+            Node* nxt = cur->next;
+            delete cur;
+            cur = nxt;
         }
     }
 
-    void remove(const T &value) {
-        auto it = lookup.find(value);
-        if (it == lookup.end()) return;
-        auto nit = it->second;
-        if (!nit->present) return; // already removed
+    // ---------------- Core Operations ----------------
 
-        nit->present = false;
-        nit->remove_version = (active_iterators > 0 ? version + 1 : version);
-    }
-
-    // Begin an iteration session and return the snapshot version to iterate over.
-    size_t beginIteration() {
-        ++active_iterators;
-        return version; // snapshot V = current committed version
-    }
-
-    // End iteration session.
-    void endIteration() {
-        if (active_iterators == 0) return;
-        --active_iterators;
-        // when the last active iterator finishes, we commit pending scheduled changes
-        // by bumping version so version+1 scheduled changes become visible.
-        if (active_iterators == 0) {
-            ++version;
-            garbage_collect_if_safe();
+    bool add(const T& val) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = map.find(val);
+        if (it != map.end()) {
+            Node* node = it->second;
+            if (node->delete_ver == std::numeric_limits<uint64_t>::max())
+                return false; // already active
         }
+        uint64_t ver = ++version;
+        Node* node = new Node(val, ver);
+        tail->next = node;
+        tail = node;
+        map[val] = node;
+        return true;
     }
 
-    // Iterate over snapshot_version V, applying Fn(value) for visible elements.
-    template<typename Fn>
-    void iterate_snapshot(size_t snapshot_version, Fn &&fn) const {
-        for (const auto &node : nodes) {
-            if (node.add_version <= snapshot_version && (node.remove_version == 0 || node.remove_version > snapshot_version)) {
-                fn(node.value);
-            }
-        }
+    bool remove(const T& val) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = map.find(val);
+        if (it == map.end())
+            return false;
+        Node* node = it->second;
+        if (node->delete_ver != std::numeric_limits<uint64_t>::max())
+            return false; // already deleted
+        node->delete_ver = ++version;
+        map.erase(it);
+        return true;
     }
 
-    // RAII Snapshot object to manage begin/end automatically.
-    class Snapshot {
-        CustomSet<T> &parent;
-        size_t snap_ver;
-        bool active;
-    public:
-        Snapshot(CustomSet<T> &p) : parent(p), snap_ver(parent.beginIteration()), active(true) {}
-        ~Snapshot() { if (active) parent.endIteration(); }
-        Snapshot(const Snapshot&) = delete;
-        Snapshot& operator=(const Snapshot&) = delete;
-        Snapshot(Snapshot&& o) noexcept : parent(o.parent), snap_ver(o.snap_ver), active(o.active) { o.active = false; }
-        size_t version() const { return snap_ver; }
+    bool contains(const T& val) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = map.find(val);
+        return (it != map.end());
+    }
 
-        template<typename Fn>
-        void for_each(Fn &&fn) const {
-            parent.iterate_snapshot(snap_ver, std::forward<Fn>(fn));
+    // ---------------- Iteration ----------------
+
+    void iterateSnapshot() {
+        std::lock_guard<std::mutex> lock(mtx);
+        uint64_t snap = version;
+        std::cout << "[Snapshot version " << snap << "]: ";
+        for (Node* cur = head->next; cur; cur = cur->next) {
+            if (cur->insert_ver <= snap && cur->delete_ver > snap)
+                std::cout << cur->value << " ";
         }
-    };
+        std::cout << "\n";
+    }
+
+    // ---------------- Debug Helpers ----------------
+
+    void printLive() {
+        std::lock_guard<std::mutex> lock(mtx);
+        std::cout << "Live set: ";
+        for (auto& [key, _] : map)
+            std::cout << key << " ";
+        std::cout << "\n";
+    }
 };
+
+int main() {
+    VersionedSet<int> vs;
+    vs.add(1);
+    vs.add(2);
+    vs.add(3);
+
+    vs.iterateSnapshot();   // Snapshot 3: 1 2 3
+
+    vs.remove(3);
+    vs.add(4);
+    vs.iterateSnapshot();   // Snapshot 5: 1 2 4
+
+    vs.add(5);
+    vs.remove(2);
+    vs.iterateSnapshot();   // Snapshot 7: 1 4 5
+
+    vs.printLive();         // Live set: 1 4 5
+}
