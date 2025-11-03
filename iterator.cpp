@@ -1,99 +1,93 @@
-#include <bits/stdc++.h>
-using namespace std;
+#include <iostream>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <memory>
 
 class CustomSet {
 private:
-    unordered_set<int> data; // main data storage
+    int currVersion = 0;
+
+    // Tracks presence of elements for each version
+    // element -> vector of (version, isPresent)
+    std::unordered_map<int, std::vector<std::pair<int, bool>>> history;
+
+    // Fast access for current version
+    std::unordered_set<int> currentSet;
 
 public:
-    // Add element to the set
-    bool add(int i) {
-        return data.insert(i).second; // returns true if insertion happened
+    // Add element
+    bool add(int x) {
+        if (currentSet.count(x)) return false;
+
+        currentSet.insert(x);
+        history[x].push_back({++currVersion, true});
+        return true;
     }
 
-    // Remove element from the set
-    bool remove(int i) {
-        return data.erase(i) > 0; // returns true if element existed
+    // Remove element
+    bool remove(int x) {
+        if (!currentSet.count(x)) return false;
+
+        currentSet.erase(x);
+        history[x].push_back({++currVersion, false});
+        return true;
     }
 
-    // Check if element exists in the set
-    bool contains(int i) const {
-        return data.find(i) != data.end();
+    // Check containment (current state)
+    bool contains(int x) const {
+        return currentSet.count(x);
     }
 
-    // Snapshot iterator class
+    // Take a snapshot: returns a version number
+    int takeSnapshot() {
+        return currVersion;
+    }
+
+    // Iterator snapshot type
     class Iterator {
     private:
-        vector<int> snapshot;
-        size_t index;
+        std::vector<int> elements;
+        size_t idx = 0;
 
     public:
-        Iterator(const unordered_set<int>& currentSet) {
-            // Take snapshot of current elements
-            snapshot.assign(currentSet.begin(), currentSet.end());
-            index = 0;
-        }
-
-        bool hasNext() const {
-            return index < snapshot.size();
-        }
-
-        int next() {
-            return snapshot[index++];
-        }
+        Iterator(std::vector<int> elems) : elements(std::move(elems)) {}
+        bool hasNext() const { return idx < elements.size(); }
+        int next() { return elements[idx++]; }
     };
 
-    // Returns a snapshot iterator over current elements
-    Iterator iterator() const {
-        return Iterator(data);
+    // Create iterator for snapshot version
+    Iterator iterator(int version = -1) const {
+        if (version == -1)
+            version = currVersion; // default: current version
+
+        std::vector<int> snapshotElements;
+        for (auto& [elem, logs] : history) {
+            // binary search for latest <= version
+            int l = 0, r = (int)logs.size() - 1;
+            bool present = false;
+            while (l <= r) {
+                int m = (l + r) / 2;
+                if (logs[m].first <= version) {
+                    present = logs[m].second;
+                    l = m + 1;
+                } else {
+                    r = m - 1;
+                }
+            }
+            if (present)
+                snapshotElements.push_back(elem);
+        }
+
+        return Iterator(snapshotElements);
     }
 
-    // Print all elements using snapshot iterator
-    void printAll() const {
-        Iterator it = iterator();
-        cout << "[";
-        bool first = true;
+    // Print all elements for snapshot
+    void printAll(int version = -1) const {
+        auto it = iterator(version);
         while (it.hasNext()) {
-            if (!first) cout << ", ";
-            cout << it.next();
-            first = false;
+            std::cout << it.next() << " ";
         }
-        cout << "]" << endl;
+        std::cout << std::endl;
     }
 };
-
-int main() {
-    CustomSet s;
-    s.add(2);
-    s.add(3);
-    s.add(4);
-    s.remove(3);
-
-    auto it = s.iterator(); // snapshot: [2, 4]
-
-    s.add(5);
-    cout << boolalpha << "contains(5): " << s.contains(5) << endl; // true
-
-    s.remove(5);
-    s.add(6);
-    s.remove(6);
-    s.add(6);
-
-    cout << boolalpha << "contains(5): " << s.contains(5) << endl; // false
-
-    // Iteration should reflect snapshot [2, 4]
-    cout << "iteration result -> [";
-    bool first = true;
-    while (it.hasNext()) {
-        if (!first) cout << ", ";
-        cout << it.next();
-        first = false;
-    }
-    cout << "]" << endl;
-
-    // Current state reflects live set
-    cout << "current state -> ";
-    s.printAll();
-
-    return 0;
-}
